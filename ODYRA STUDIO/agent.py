@@ -29,6 +29,9 @@ from livekit import api
 from livekit.agents import (
     Agent,
     AgentSession,
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
     JobContext,
     JobProcess,
     RunContext,
@@ -101,6 +104,27 @@ PROMPT_PATH = os.path.join(HERE, "EVA_system_prompt.txt")
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
+# ───────────────────────── Filler vocali + musichetta (pattern di Boss) ─────────────────────────
+# FILLER PHRASES — pronunciate mentre un tool gira, per evitare il silenzio.
+FILLER_KNOWLEDGE = "Mi lasci un istante, le verifico subito questa informazione."
+FILLER_DISPONIBILITA = "Un istante, controllo l'agenda e le verifico la disponibilità."
+FILLER_PRENOTAZIONE = "Resti pure in linea, le sto riservando l'appuntamento."
+FILLER_SPOSTA = "Un istante, le sto spostando l'appuntamento."
+FILLER_CANCELLA = "Mi lasci un istante, controllo subito i suoi appuntamenti."
+FILLER_CUSTOMER = "Un istante, la cerco subito nei nostri registri."
+
+# Soglia "filler intelligente" (stile Vapi request-response-delayed): la frase d'attesa
+# parte SOLO se il tool supera questo tempo. Sotto soglia l'agente tace e la pausa breve
+# è coperta dalla musichetta → niente "un istante" inutile sulle risposte rapide.
+FILLER_DELAY_S = 0.7
+
+# MUSICHETTA D'ATTESA (BackgroundAudioPlayer.thinking_sound): suono soft riprodotto SOLO
+# mentre l'agente è in stato "thinking" (tool in corso), su un canale audio separato gestito
+# dal framework → NON compete con la voce della risposta vera, quindi non può zittire l'agente.
+THINKING_SOUND = AudioConfig(
+    BuiltinAudioClip.HOLD_MUSIC, volume=0.4, fade_in=0.3, fade_out=0.5
+)
+
 
 # ───────────────────────── Helpers ─────────────────────────
 
@@ -165,6 +189,42 @@ class EvaAgent(Agent):
     def __init__(self, instructions: str, md: dict) -> None:
         super().__init__(instructions=instructions)
         self.md = md
+        self._filler_handle = None
+        # Filler "armato": dice UNA sola frase d'attesa per turno utente (al primo tool).
+        # I tool successivi nello stesso turno NON parlano (li copre la musichetta) → evita
+        # l'accavallarsi di più say() che ruberebbero la voce alla risposta vera. Ri-armato
+        # a ogni nuovo turno utente (vedi handler user_input_transcribed nell'entrypoint).
+        self._filler_armed = True
+
+    async def _fill_then(self, context: RunContext, phrase: str, coro):
+        """Esegue il lavoro del tool (`coro`) e, SOLO se supera FILLER_DELAY_S, dice la
+        frase d'attesa (max 1 per turno). Se il lavoro finisce prima della soglia il filler
+        NON parte: sulle risposte rapide l'agente non dice "un istante" inutilmente — la
+        pausa breve è già coperta dalla musichetta. Non aumenta mai i say() per turno."""
+        filler_task = asyncio.create_task(self._delayed_filler(context, phrase))
+        try:
+            return await coro
+        finally:
+            filler_task.cancel()  # tool finito: se il filler non è ancora partito, non parte
+
+    async def _delayed_filler(self, context: RunContext, phrase: str) -> None:
+        """Attende la soglia; se non viene cancellato (tool ancora in corso) dice UNA frase.
+        add_to_chat_ctx=False: solo voce, fuori dal contesto del modello."""
+        try:
+            await asyncio.sleep(FILLER_DELAY_S)
+        except asyncio.CancelledError:
+            return  # il tool è finito prima della soglia → niente filler
+        try:
+            if not self._filler_armed:
+                return  # già detta una frase in questo turno
+            if self._filler_handle is not None and not self._filler_handle.done():
+                return
+            self._filler_armed = False
+            self._filler_handle = context.session.say(
+                phrase, allow_interruptions=True, add_to_chat_ctx=False
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("filler skipped: %s", e)
 
     # --- accessor metadata (mai esposti al modello) ---
     @property
@@ -190,7 +250,9 @@ class EvaAgent(Agent):
         """Rispondi a domande su trattamenti, prodotti, risultati, prezzi, durate,
         sedi, promo del centro. `query` = la frase completa della cliente (mai una sola parola)."""
         # NB: host RAG diverso e campo `id` (= tenant_id), non `tenant_id`.
-        return await _post_json(RAG_URL, {"id": self.tenant_id, "query": query})
+        return await self._fill_then(
+            context, FILLER_KNOWLEDGE,
+            _post_json(RAG_URL, {"id": self.tenant_id, "query": query}))
 
     @function_tool()
     async def get_data_oggi(self, context: RunContext) -> str:
@@ -234,7 +296,9 @@ class EvaAgent(Agent):
             "date_to": dt,
             "phone": self.lead_phone,
         }
-        return _extract_results(await _post_json(f"{CORE_BASE}/core-cerca-disponibilita", payload))
+        return _extract_results(await self._fill_then(
+            context, FILLER_DISPONIBILITA,
+            _post_json(f"{CORE_BASE}/core-cerca-disponibilita", payload)))
 
     @function_tool()
     async def controllo_disponibilita(
@@ -255,7 +319,9 @@ class EvaAgent(Agent):
         }
         if self.lead_email:
             payload["email"] = self.lead_email
-        return await _post_json(f"{CORE_BASE}/core-disponibilita-slot-specifico", payload)
+        return await self._fill_then(
+            context, FILLER_DISPONIBILITA,
+            _post_json(f"{CORE_BASE}/core-disponibilita-slot-specifico", payload))
 
     @function_tool()
     async def cerca_disponibilita_settimana(
@@ -276,7 +342,9 @@ class EvaAgent(Agent):
             "date_to": _iso(end),
             "phone": self.lead_phone,
         }
-        return _extract_results(await _post_json(f"{CORE_BASE}/core-cerca-disponibilita", payload))
+        return _extract_results(await self._fill_then(
+            context, FILLER_DISPONIBILITA,
+            _post_json(f"{CORE_BASE}/core-cerca-disponibilita", payload)))
 
     @function_tool()
     async def cerca_disponibilita_multi(
@@ -313,7 +381,9 @@ class EvaAgent(Agent):
             "services": services,
         }
         return _extract_results(
-            await _post_json(f"{CORE_BASE}/core-cerca-disponibilita-multi", payload)
+            await self._fill_then(
+                context, FILLER_DISPONIBILITA,
+                _post_json(f"{CORE_BASE}/core-cerca-disponibilita-multi", payload))
         )
 
     # ───────── C. Prenotazione ─────────
@@ -340,7 +410,9 @@ class EvaAgent(Agent):
         }
         if self.lead_email:
             payload["email"] = self.lead_email
-        return await _post_json(f"{CORE_BASE}/core-prenotazione-appuntamento", payload)
+        return await self._fill_then(
+            context, FILLER_PRENOTAZIONE,
+            _post_json(f"{CORE_BASE}/core-prenotazione-appuntamento", payload))
 
     @function_tool()
     async def prenotazione_multi(
@@ -379,7 +451,9 @@ class EvaAgent(Agent):
             "phone": self.lead_phone,
             "slots": slots,
         }
-        return await _post_json(f"{CORE_BASE}/core-prenotazione-multi", payload)
+        return await self._fill_then(
+            context, FILLER_PRENOTAZIONE,
+            _post_json(f"{CORE_BASE}/core-prenotazione-multi", payload))
 
     # ───────── D. Spostamento ─────────
 
@@ -409,7 +483,9 @@ class EvaAgent(Agent):
         }
         if self.lead_email:
             payload["email"] = self.lead_email
-        return await _post_json(f"{CORE_BASE}/core-spostamento-appuntamento", payload)
+        return await self._fill_then(
+            context, FILLER_SPOSTA,
+            _post_json(f"{CORE_BASE}/core-spostamento-appuntamento", payload))
 
     @function_tool()
     async def spostamento_multi(
@@ -455,7 +531,9 @@ class EvaAgent(Agent):
             "event_ids": event_ids,
             "slots": slots,
         }
-        return await _post_json(f"{CORE_BASE}/core-spostamento-multi", payload)
+        return await self._fill_then(
+            context, FILLER_SPOSTA,
+            _post_json(f"{CORE_BASE}/core-spostamento-multi", payload))
 
     # ───────── E. Cancellazione ─────────
 
@@ -470,7 +548,9 @@ class EvaAgent(Agent):
         }
         if self.lead_email:
             payload["email"] = self.lead_email
-        return await _post_json(f"{CORE_BASE}/core-cancellazione-appuntamento", payload)
+        return await self._fill_then(
+            context, FILLER_CANCELLA,
+            _post_json(f"{CORE_BASE}/core-cancellazione-appuntamento", payload))
 
     @function_tool()
     async def cancellazione_multi(
@@ -485,7 +565,9 @@ class EvaAgent(Agent):
         if event_id_3:
             event_ids.append(event_id_3)
         payload = {"tenant_id": self.tenant_id, "event_ids": event_ids}
-        return await _post_json(f"{CORE_BASE}/core-cancellazione-multi", payload)
+        return await self._fill_then(
+            context, FILLER_CANCELLA,
+            _post_json(f"{CORE_BASE}/core-cancellazione-multi", payload))
 
     # ───────── F. Verifica & handoff ─────────
 
@@ -493,7 +575,9 @@ class EvaAgent(Agent):
     async def customer_verification(self, context: RunContext) -> str:
         """Verifica se la cliente è già presente nel gestionale (per telefono)."""
         payload = {"phone": self.lead_phone, "tenant_id": self.tenant_id}
-        return await _post_json(f"{CORE_BASE}/core-customer-verification", payload)
+        return await self._fill_then(
+            context, FILLER_CUSTOMER,
+            _post_json(f"{CORE_BASE}/core-customer-verification", payload))
 
     @function_tool()
     async def trasferisci_operatore(self, context: RunContext, motivo: str) -> str:
@@ -625,6 +709,15 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("user_state_changed", _touch)
     session.on("agent_state_changed", _touch)
 
+    # Ri-arma il filler a ogni nuovo turno utente (final transcript) → max 1 frase d'attesa
+    # per turno, come Boss. I tool successivi nello stesso turno li copre la musichetta.
+    def _on_user_text(ev) -> None:
+        _touch()
+        if getattr(ev, "is_final", False):
+            agent._filler_armed = True
+
+    session.on("user_input_transcribed", _on_user_text)
+
     # Il lead riaggancia → chiusura con motivo dedicato.
     def _on_disconnect(participant) -> None:
         ident = getattr(participant, "identity", "")
@@ -659,6 +752,15 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # 5) Avvia la sessione
     await session.start(agent=agent, room=ctx.room)
+
+    # Musichetta d'attesa: parte da sola quando l'agente "pensa" (tool in corso) e si ferma
+    # da sola quando ricomincia a parlare. Canale audio separato → maschera la latenza SENZA
+    # rischio di zittire l'agente. Complementare al filler vocale.
+    try:
+        background_audio = BackgroundAudioPlayer(thinking_sound=THINKING_SOUND)
+        await background_audio.start(room=ctx.room, agent_session=session)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("musichetta d'attesa non avviata: %s", e)
 
     # 6) Outbound first turn: aspetta che il lead (SIP participant) si connetta, poi apri.
     try:
