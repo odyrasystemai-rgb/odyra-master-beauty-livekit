@@ -42,6 +42,16 @@ from livekit.agents import (
 from livekit.plugins import cartesia, deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# AMD (Answering Machine Detection) — disponibile nelle versioni recenti di
+# livekit-agents. Import difensivo: se la versione installata non lo include,
+# il worker NON crasha e ricade sul flusso originale senza rilevamento.
+try:
+    from livekit.agents import AMD  # type: ignore
+    _AMD_AVAILABLE = True
+except ImportError:
+    AMD = None  # type: ignore
+    _AMD_AVAILABLE = False
+
 load_dotenv()
 
 logger = logging.getLogger("eva")
@@ -93,6 +103,20 @@ SILENCE_TIMEOUT_S = float(os.getenv("SILENCE_TIMEOUT_S", "191"))
 
 # Stima costo per minuto (EUR) per il payload EOC; il calcolo "vero" lo fa n8n.
 COST_PER_MINUTE_EUR = float(os.getenv("EOC_COST_PER_MINUTE_EUR", "0") or 0)
+
+# ── AMD (Answering Machine Detection) ──
+# Rileva se a rispondere è una PERSONA o una segreteria/IVR PRIMA che Eva parli.
+# Kill-switch: AMD_ENABLED=false → comportamento originale (nessun rilevamento).
+AMD_ENABLED = os.getenv("AMD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Se la chiamata finisce in segreteria (machine-vm): lasciare un breve messaggio
+# prima di chiudere? Default OFF (per outbound a freddo conviene riprovare dopo).
+AMD_LEAVE_VOICEMAIL = os.getenv("AMD_LEAVE_VOICEMAIL", "false").lower() in ("1", "true", "yes", "on")
+AMD_VOICEMAIL_INSTRUCTIONS = os.getenv(
+    "AMD_VOICEMAIL_INSTRUCTIONS",
+    "Hai raggiunto una segreteria telefonica. Lascia un messaggio MOLTO breve in "
+    "italiano: presentati col nome del centro, di' che richiamerai a breve, e saluta "
+    "con garbo. Massimo due frasi. Non lasciare numeri né dettagli.",
+)
 
 # Date/ISO. Il brief richiede ESPLICITAMENTE offset +01:00 (come l'originale Vapi).
 ROME = ZoneInfo("Europe/Rome")
@@ -744,6 +768,9 @@ async def entrypoint(ctx: JobContext) -> None:
             "lead_phone": md.get("lead_phone"),
             "attempt_number": md.get("attempt_number"),
             "agent": AGENT_NAME,
+            # esito AMD (None se AMD disabilitato/non disponibile): permette al workflow
+            # di qualificazione di separare voicemail/IVR dai pickup umani reali.
+            "amd_category": state.get("amd_category"),
         }
         logger.info("EOC POST (reason=%s, dur=%ss)", state["ended_reason"], duration)
         await _post_json(EOC_WEBHOOK_URL, payload)
@@ -762,14 +789,60 @@ async def entrypoint(ctx: JobContext) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("musichetta d'attesa non avviata: %s", e)
 
-    # 6) Outbound first turn: aspetta che il lead (SIP participant) si connetta, poi apri.
-    try:
-        await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
-    except asyncio.TimeoutError:
-        logger.warning("Nessuna risposta dal lead entro il timeout")
-        state["ended_reason"] = "no_answer"
-        await _hangup(ctx)
-        return
+    # 6) Outbound first turn con AMD: attende il lead, classifica umano/segreteria/IVR,
+    #    e SOLO se risponde una PERSONA (o esito incerto) apre la conversazione.
+    #    Se AMD è disabilitato o non presente nella versione installata → flusso originale.
+    if _AMD_AVAILABLE and AMD_ENABLED:
+        # ivr_detection=False: non navigare alberi IVR (per outbound a freddo non serve);
+        # suppress_compatibility_warning=True: silenzia il warning sui modelli usati per la
+        # classificazione (AMD usa i suoi default LiveKit Inference, con fallback ai modelli
+        # della sessione — gpt-4.1-mini / deepgram nova-3, entrambi nel set valutato).
+        async with AMD(session, ivr_detection=False, suppress_compatibility_warning=True) as detector:
+            # Il SIP participant lo crea il dispatcher; qui attendiamo solo che si connetta.
+            try:
+                await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
+            except asyncio.TimeoutError:
+                logger.warning("Nessuna risposta dal lead entro il timeout")
+                state["ended_reason"] = "no_answer"
+                await _hangup(ctx)
+                return
+
+            # Classifica la chiamata (gira una volta, sul saluto iniziale).
+            try:
+                result = await detector.execute()
+                category = getattr(result, "category", "uncertain")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("AMD fallita (%s) → procedo come umano", e)
+                category = "uncertain"
+            state["amd_category"] = category
+            logger.info("AMD category=%s", category)
+
+            # Solo human/uncertain proseguono nella conversazione.
+            if category not in ("human", "uncertain"):
+                if category == "machine-vm" and AMD_LEAVE_VOICEMAIL:
+                    try:
+                        await session.generate_reply(instructions=AMD_VOICEMAIL_INSTRUCTIONS)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("messaggio in segreteria non riuscito")
+                state["ended_reason"] = {
+                    "machine-vm": "voicemail",
+                    "machine-unavailable": "machine_unavailable",
+                    "machine-ivr": "machine_ivr",
+                }.get(category, "machine")
+                await _hangup(ctx)
+                return
+    else:
+        # AMD off o non disponibile: comportamento originale (attendi il partecipante).
+        if AMD_ENABLED and not _AMD_AVAILABLE:
+            logger.warning("AMD richiesto ma non disponibile in questa versione di "
+                           "livekit-agents → flusso senza rilevamento segreteria")
+        try:
+            await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
+        except asyncio.TimeoutError:
+            logger.warning("Nessuna risposta dal lead entro il timeout")
+            state["ended_reason"] = "no_answer"
+            await _hangup(ctx)
+            return
 
     # Watchdog silenzio (auto-hangup ~191s)
     async def _silence_watchdog() -> None:
