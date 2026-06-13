@@ -105,11 +105,44 @@ SILENCE_TIMEOUT_S = float(os.getenv("SILENCE_TIMEOUT_S", "191"))
 COST_PER_MINUTE_EUR = float(os.getenv("EOC_COST_PER_MINUTE_EUR", "0") or 0)
 
 # ── AMD (Answering Machine Detection) ──
-# Rileva se a rispondere è una PERSONA o una segreteria/IVR PRIMA che Eva parli.
+# Stesso set di ENV del worker Boss, così le due immagini si configurano allo stesso
+# modo (puoi anche promuoverle a Shared Variables Railway e condividerle tra i servizi).
 # Kill-switch: AMD_ENABLED=false → comportamento originale (nessun rilevamento).
 AMD_ENABLED = os.getenv("AMD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-# Se la chiamata finisce in segreteria (machine-vm): lasciare un breve messaggio
-# prima di chiudere? Default OFF (per outbound a freddo conviene riprovare dopo).
+# Modello per la classificazione (LiveKit Inference model ID, es. "openai/gpt-4.1-mini"
+# o "google/gemini-3.1-flash-lite"). Vuoto = default LiveKit (gemini-3.1-flash-lite).
+AMD_LLM_MODEL = os.getenv("AMD_LLM_MODEL", "").strip() or None
+# machine-ivr → riagganciare? (true per outbound a freddo: l'IVR non è il lead).
+AMD_IVR_HANGUP = os.getenv("AMD_IVR_HANGUP", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _read_amd_detection_options() -> dict:
+    """Soglie di detection (secondi) dalle ENV. Solo quelle effettivamente impostate;
+    le altre ricadono sui default della libreria (human_speech 2.5, human_silence 0.5,
+    machine_silence 1.5, no_speech 10.0, timeout 20.0)."""
+    opts: dict = {}
+    for key, env in (
+        ("human_speech_threshold", "AMD_HUMAN_SPEECH_THRESHOLD_S"),
+        ("human_silence_threshold", "AMD_HUMAN_SILENCE_THRESHOLD_S"),
+        ("machine_silence_threshold", "AMD_MACHINE_SILENCE_THRESHOLD_S"),
+        ("no_speech_threshold", "AMD_NO_SPEECH_THRESHOLD_S"),
+        ("timeout", "AMD_TIMEOUT_S"),
+    ):
+        raw = os.getenv(env, "").strip()
+        if not raw:
+            continue
+        try:
+            opts[key] = float(raw)
+        except ValueError:
+            logger.warning("ENV %s non numerica (%r): ignorata", env, raw)
+    return opts
+
+
+AMD_DETECTION_OPTIONS = _read_amd_detection_options()
+
+# Extra Eva-specifico (il worker Boss non lo usa): su machine-vm, lasciare un breve
+# messaggio in segreteria prima di chiudere. Default OFF (per outbound a freddo conviene
+# riprovare dopo). Se lo accendi, personalizza il testo con AMD_VOICEMAIL_INSTRUCTIONS.
 AMD_LEAVE_VOICEMAIL = os.getenv("AMD_LEAVE_VOICEMAIL", "false").lower() in ("1", "true", "yes", "on")
 AMD_VOICEMAIL_INSTRUCTIONS = os.getenv(
     "AMD_VOICEMAIL_INSTRUCTIONS",
@@ -793,11 +826,17 @@ async def entrypoint(ctx: JobContext) -> None:
     #    e SOLO se risponde una PERSONA (o esito incerto) apre la conversazione.
     #    Se AMD è disabilitato o non presente nella versione installata → flusso originale.
     if _AMD_AVAILABLE and AMD_ENABLED:
-        # ivr_detection=False: non navigare alberi IVR (per outbound a freddo non serve);
-        # suppress_compatibility_warning=True: silenzia il warning sui modelli usati per la
-        # classificazione (AMD usa i suoi default LiveKit Inference, con fallback ai modelli
-        # della sessione — gpt-4.1-mini / deepgram nova-3, entrambi nel set valutato).
-        async with AMD(session, ivr_detection=False, suppress_compatibility_warning=True) as detector:
+        # ivr_detection=False: non navighiamo alberi IVR (consumer outbound). Cosa fare su
+        # machine-ivr (riagganciare o trattare come umano) è governato da AMD_IVR_HANGUP.
+        # llm: AMD_LLM_MODEL se impostata, altrimenti default LiveKit Inference.
+        # detection_options: solo le soglie effettivamente impostate via ENV.
+        # suppress_compatibility_warning=True: silenzia il warning sui modelli di classifica.
+        amd_kwargs: dict = {"ivr_detection": False, "suppress_compatibility_warning": True}
+        if AMD_LLM_MODEL:
+            amd_kwargs["llm"] = AMD_LLM_MODEL
+        if AMD_DETECTION_OPTIONS:
+            amd_kwargs["detection_options"] = AMD_DETECTION_OPTIONS
+        async with AMD(session, **amd_kwargs) as detector:
             # Il SIP participant lo crea il dispatcher; qui attendiamo solo che si connetta.
             try:
                 await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
@@ -817,8 +856,14 @@ async def entrypoint(ctx: JobContext) -> None:
             state["amd_category"] = category
             logger.info("AMD category=%s", category)
 
-            # Solo human/uncertain proseguono nella conversazione.
-            if category not in ("human", "uncertain"):
+            # human/uncertain → conversazione normale.
+            # machine-ivr → riaggancia solo se AMD_IVR_HANGUP, altrimenti tratta come umano.
+            # machine-vm / machine-unavailable → niente conversazione.
+            hangup_categories = {"machine-vm", "machine-unavailable"}
+            if AMD_IVR_HANGUP:
+                hangup_categories.add("machine-ivr")
+
+            if category in hangup_categories:
                 if category == "machine-vm" and AMD_LEAVE_VOICEMAIL:
                     try:
                         await session.generate_reply(instructions=AMD_VOICEMAIL_INSTRUCTIONS)
@@ -831,6 +876,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 }.get(category, "machine")
                 await _hangup(ctx)
                 return
+            # altrimenti (human/uncertain, o machine-ivr con AMD_IVR_HANGUP=false) → prosegui
     else:
         # AMD off o non disponibile: comportamento originale (attendi il partecipante).
         if AMD_ENABLED and not _AMD_AVAILABLE:
