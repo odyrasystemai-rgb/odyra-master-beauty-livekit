@@ -8,8 +8,11 @@ NON da lookup su DB.
 
 agent_name = "eva-outbound"  (deve combaciare col nodo n8n e col dispatcher).
 
-Costruito da zero con i pattern standard di livekit-agents 1.5.x.
-Non dipende dall'agente "Boss".
+Fix applicati vs versione originale:
+- AMD_LLM_MODEL: passato come openai.LLM(model=...) non come stringa grezza.
+- BARGE-IN: frase brevissima + generate_reply in parallelo con AMD → latenza ~1s.
+- Cancellazione barge-in su segreteria rilevata.
+- Rimosso generate_reply finale (sostituito dal barge-in).
 """
 
 from __future__ import annotations
@@ -42,9 +45,6 @@ from livekit.agents import (
 from livekit.plugins import cartesia, deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# AMD (Answering Machine Detection) — disponibile nelle versioni recenti di
-# livekit-agents. Import difensivo: se la versione installata non lo include,
-# il worker NON crasha e ricade sul flusso originale senza rilevamento.
 try:
     from livekit.agents import AMD  # type: ignore
     _AMD_AVAILABLE = True
@@ -57,19 +57,15 @@ load_dotenv()
 logger = logging.getLogger("eva")
 logging.basicConfig(level=logging.INFO)
 
-# ───────────────────────── Config (vedi EVA_build_brief.md) ─────────────────────────
+# ───────────────────────── Config ─────────────────────────
 
 AGENT_NAME = "eva-outbound"
 
-# LLM / TTS / STT
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")
 
-# Cartesia: voice e model dal brief. Se il plugin non accetta "sonic-3.5",
-# si usa l'ultima `sonic` disponibile (override via env CARTESIA_MODEL).
 CARTESIA_VOICE = os.getenv("CARTESIA_VOICE", "36d94908-c5b9-4014-b521-e69aee5bead0")
 CARTESIA_MODEL = os.getenv("CARTESIA_MODEL", "sonic-3") or "sonic-3"
 
-# Deepgram nova-3, italiano, numerals on, con keyterm list (in fondo al brief).
 KEYTERMS = [
     "chiocciola", "punto", "virgola", "trattino", "trattino basso", "underscore",
     "gmail", "yahoo", "hotmail", "outlook", "libero", "alice", "tim", "virgilio",
@@ -78,48 +74,32 @@ KEYTERMS = [
     "zero", "uno", "due", "tre", "quattro", "cinque", "sei", "sette", "otto", "nove",
 ]
 
-# SIP outbound (Eva). NON usare il trunk di Boss.
 SIP_OUTBOUND_TRUNK_ID = os.getenv("SIP_OUTBOUND_TRUNK_ID", "ST_Yuv6LbXJTLno")
 SIP_FROM_NUMBER = os.getenv("SIP_FROM_NUMBER", "+390230329429")
 
-# Webhook base URLs (override via env; default = host di produzione attuali).
 CORE_BASE = os.getenv(
     "CORE_BASE_URL",
     "https://primary-production-eb20.up.railway.app/webhook",
-)  # tool gestionali/booking (odyra-studio-api)
+)
 RAG_URL = os.getenv(
     "RAG_URL",
     "https://rag-production-6ab5.up.railway.app/",
-)  # knowledge (host DIVERSO)
+)
 
-# End-of-call webhook (lo stesso che usava l'agente Beauty su Vapi).
 EOC_WEBHOOK_URL = os.getenv(
     "EOC_WEBHOOK_URL",
     "https://primary-production-eb20.up.railway.app/webhook/vapi-end-of-call",
 )
 
-# Silence auto-hangup (valore originale Beauty).
 SILENCE_TIMEOUT_S = float(os.getenv("SILENCE_TIMEOUT_S", "191"))
-
-# Stima costo per minuto (EUR) per il payload EOC; il calcolo "vero" lo fa n8n.
 COST_PER_MINUTE_EUR = float(os.getenv("EOC_COST_PER_MINUTE_EUR", "0") or 0)
 
-# ── AMD (Answering Machine Detection) ──
-# Stesso set di ENV del worker Boss, così le due immagini si configurano allo stesso
-# modo (puoi anche promuoverle a Shared Variables Railway e condividerle tra i servizi).
-# Kill-switch: AMD_ENABLED=false → comportamento originale (nessun rilevamento).
 AMD_ENABLED = os.getenv("AMD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-# Modello per la classificazione (LiveKit Inference model ID, es. "openai/gpt-4.1-mini"
-# o "google/gemini-3.1-flash-lite"). Vuoto = default LiveKit (gemini-3.1-flash-lite).
 AMD_LLM_MODEL = os.getenv("AMD_LLM_MODEL", "").strip() or None
-# machine-ivr → riagganciare? (true per outbound a freddo: l'IVR non è il lead).
 AMD_IVR_HANGUP = os.getenv("AMD_IVR_HANGUP", "true").lower() in ("1", "true", "yes", "on")
 
 
 def _read_amd_detection_options() -> dict:
-    """Soglie di detection (secondi) dalle ENV. Solo quelle effettivamente impostate;
-    le altre ricadono sui default della libreria (human_speech 2.5, human_silence 0.5,
-    machine_silence 1.5, no_speech 10.0, timeout 20.0)."""
     opts: dict = {}
     for key, env in (
         ("human_speech_threshold", "AMD_HUMAN_SPEECH_THRESHOLD_S"),
@@ -140,9 +120,6 @@ def _read_amd_detection_options() -> dict:
 
 AMD_DETECTION_OPTIONS = _read_amd_detection_options()
 
-# Extra Eva-specifico (il worker Boss non lo usa): su machine-vm, lasciare un breve
-# messaggio in segreteria prima di chiudere. Default OFF (per outbound a freddo conviene
-# riprovare dopo). Se lo accendi, personalizza il testo con AMD_VOICEMAIL_INSTRUCTIONS.
 AMD_LEAVE_VOICEMAIL = os.getenv("AMD_LEAVE_VOICEMAIL", "false").lower() in ("1", "true", "yes", "on")
 AMD_VOICEMAIL_INSTRUCTIONS = os.getenv(
     "AMD_VOICEMAIL_INSTRUCTIONS",
@@ -151,7 +128,6 @@ AMD_VOICEMAIL_INSTRUCTIONS = os.getenv(
     "con garbo. Massimo due frasi. Non lasciare numeri né dettagli.",
 )
 
-# Date/ISO. Il brief richiede ESPLICITAMENTE offset +01:00 (come l'originale Vapi).
 ROME = ZoneInfo("Europe/Rome")
 ISO_OFFSET = "+01:00"
 
@@ -161,8 +137,6 @@ PROMPT_PATH = os.path.join(HERE, "EVA_system_prompt.txt")
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-# ───────────────────────── Filler vocali + musichetta (pattern di Boss) ─────────────────────────
-# FILLER PHRASES — pronunciate mentre un tool gira, per evitare il silenzio.
 FILLER_KNOWLEDGE = "Mi lasci un istante, le verifico subito questa informazione."
 FILLER_DISPONIBILITA = "Un istante, controllo l'agenda e le verifico la disponibilità."
 FILLER_PRENOTAZIONE = "Resti pure in linea, le sto riservando l'appuntamento."
@@ -170,14 +144,8 @@ FILLER_SPOSTA = "Un istante, le sto spostando l'appuntamento."
 FILLER_CANCELLA = "Mi lasci un istante, controllo subito i suoi appuntamenti."
 FILLER_CUSTOMER = "Un istante, la cerco subito nei nostri registri."
 
-# Soglia "filler intelligente" (stile Vapi request-response-delayed): la frase d'attesa
-# parte SOLO se il tool supera questo tempo. Sotto soglia l'agente tace e la pausa breve
-# è coperta dalla musichetta → niente "un istante" inutile sulle risposte rapide.
 FILLER_DELAY_S = 0.7
 
-# MUSICHETTA D'ATTESA (BackgroundAudioPlayer.thinking_sound): suono soft riprodotto SOLO
-# mentre l'agente è in stato "thinking" (tool in corso), su un canale audio separato gestito
-# dal framework → NON compete con la voce della risposta vera, quindi non può zittire l'agente.
 THINKING_SOUND = AudioConfig(
     BuiltinAudioClip.HOLD_MUSIC, volume=0.4, fade_in=0.3, fade_out=0.5
 )
@@ -191,7 +159,6 @@ def _load_prompt_template() -> str:
 
 
 def fill_prompt(template: str, md: dict) -> str:
-    """Sostituisce ogni {{chiave}} con md["chiave"]; placeholder mancante → stringa vuota."""
     return PLACEHOLDER_RE.sub(lambda m: str(md.get(m.group(1).strip(), "")), template)
 
 
@@ -200,12 +167,10 @@ def _now() -> datetime:
 
 
 def _iso(dt: datetime) -> str:
-    """Formatta in ISO 8601 con offset +01:00 (come da brief)."""
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ISO_OFFSET
 
 
 def _day_bounds(any_iso_or_date: str) -> tuple[str, str]:
-    """Da una data/datetime ISO ricava (giorno 00:00, giorno 23:59) in ISO +01:00."""
     day = datetime.fromisoformat(any_iso_or_date[:10]).date()
     start = datetime(day.year, day.month, day.day, 0, 0, 0)
     end = datetime(day.year, day.month, day.day, 23, 59, 59)
@@ -213,7 +178,6 @@ def _day_bounds(any_iso_or_date: str) -> tuple[str, str]:
 
 
 async def _post_json(url: str, payload: dict) -> str:
-    """POST JSON, ritorna il testo della risposta (o un messaggio d'errore leggibile dal modello)."""
     try:
         async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as s:
             async with s.post(url, json=payload) as resp:
@@ -226,7 +190,6 @@ async def _post_json(url: str, payload: dict) -> str:
 
 
 def _extract_results(text: str) -> str:
-    """Per le cerche 'code': prova a estrarre data.results[0].result, altrimenti ritorna grezzo."""
     try:
         data = json.loads(text)
         results = data.get("results") or (data.get("data") or {}).get("results")
@@ -240,40 +203,27 @@ def _extract_results(text: str) -> str:
 # ───────────────────────── Agent ─────────────────────────
 
 class EvaAgent(Agent):
-    """Agente Eva. `tenant_id` e `phone` NON sono argomenti del modello: vengono
-    iniettati dai metadata della room. `name` = lead_name dai metadata."""
-
     def __init__(self, instructions: str, md: dict) -> None:
         super().__init__(instructions=instructions)
         self.md = md
         self._filler_handle = None
-        # Filler "armato": dice UNA sola frase d'attesa per turno utente (al primo tool).
-        # I tool successivi nello stesso turno NON parlano (li copre la musichetta) → evita
-        # l'accavallarsi di più say() che ruberebbero la voce alla risposta vera. Ri-armato
-        # a ogni nuovo turno utente (vedi handler user_input_transcribed nell'entrypoint).
         self._filler_armed = True
 
     async def _fill_then(self, context: RunContext, phrase: str, coro):
-        """Esegue il lavoro del tool (`coro`) e, SOLO se supera FILLER_DELAY_S, dice la
-        frase d'attesa (max 1 per turno). Se il lavoro finisce prima della soglia il filler
-        NON parte: sulle risposte rapide l'agente non dice "un istante" inutilmente — la
-        pausa breve è già coperta dalla musichetta. Non aumenta mai i say() per turno."""
         filler_task = asyncio.create_task(self._delayed_filler(context, phrase))
         try:
             return await coro
         finally:
-            filler_task.cancel()  # tool finito: se il filler non è ancora partito, non parte
+            filler_task.cancel()
 
     async def _delayed_filler(self, context: RunContext, phrase: str) -> None:
-        """Attende la soglia; se non viene cancellato (tool ancora in corso) dice UNA frase.
-        add_to_chat_ctx=False: solo voce, fuori dal contesto del modello."""
         try:
             await asyncio.sleep(FILLER_DELAY_S)
         except asyncio.CancelledError:
-            return  # il tool è finito prima della soglia → niente filler
+            return
         try:
             if not self._filler_armed:
-                return  # già detta una frase in questo turno
+                return
             if self._filler_handle is not None and not self._filler_handle.done():
                 return
             self._filler_armed = False
@@ -283,7 +233,6 @@ class EvaAgent(Agent):
         except Exception as e:  # noqa: BLE001
             logger.debug("filler skipped: %s", e)
 
-    # --- accessor metadata (mai esposti al modello) ---
     @property
     def tenant_id(self) -> str:
         return str(self.md.get("tenant_id", ""))
@@ -300,13 +249,10 @@ class EvaAgent(Agent):
     def lead_email(self) -> str:
         return str(self.md.get("lead_email", ""))
 
-    # ───────── A. Knowledge & utility ─────────
-
     @function_tool()
     async def knowledge_query(self, context: RunContext, query: str) -> str:
         """Rispondi a domande su trattamenti, prodotti, risultati, prezzi, durate,
         sedi, promo del centro. `query` = la frase completa della cliente (mai una sola parola)."""
-        # NB: host RAG diverso e campo `id` (= tenant_id), non `tenant_id`.
         return await self._fill_then(
             context, FILLER_KNOWLEDGE,
             _post_json(RAG_URL, {"id": self.tenant_id, "query": query}))
@@ -329,8 +275,6 @@ class EvaAgent(Agent):
             ensure_ascii=False,
         )
 
-    # ───────── B. Ricerca disponibilità ─────────
-
     @function_tool()
     async def cerca_disponibilita(
         self,
@@ -340,10 +284,7 @@ class EvaAgent(Agent):
         duration_min: int,
         operator_slug: str = "no_preference",
     ) -> str:
-        """Disponibilità per un GIORNO SINGOLO preciso (servizio singolo).
-        Passa la data del giorno richiesto in `date_from` (formato ISO/YYYY-MM-DD).
-        Il sistema espande automaticamente il giorno a 00:00–23:59."""
-        # Espande il giorno richiesto (derivato da date_from) a 00:00..23:59 +01:00.
+        """Disponibilità per un GIORNO SINGOLO preciso (servizio singolo)."""
         df, dt = _day_bounds(date_from or date_to)
         payload = {
             "tenant_id": self.tenant_id,
@@ -365,8 +306,7 @@ class EvaAgent(Agent):
         duration_min: int,
         operator_slug: str = "no_preference",
     ) -> str:
-        """Verifica uno SLOT a ORA PRECISA (servizio singolo). `prefareDateTime` in ISO 8601
-        (YYYY-MM-DDTHH:MM:SS). Usalo quando la cliente indica un orario puntuale."""
+        """Verifica uno SLOT a ORA PRECISA (servizio singolo)."""
         payload = {
             "prefareDateTime": prefareDateTime,
             "duration_min": duration_min,
@@ -387,8 +327,7 @@ class EvaAgent(Agent):
         duration_min: int,
         operator_slug: str = "no_preference",
     ) -> str:
-        """Disponibilità della prossima settimana (servizio singolo), quando la cliente
-        non ha preferenze di giorno. Calcola da domani (00:00) a +7 giorni."""
+        """Disponibilità della prossima settimana (servizio singolo)."""
         start = (_now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=7)
         payload = {
@@ -417,8 +356,7 @@ class EvaAgent(Agent):
         service_3_duration_min: int = 0,
         service_3_operator_slug: str = "",
     ) -> str:
-        """Disponibilità per 2 o 3 servizi INSIEME. Passa nome, durata e operator_slug
-        di ogni servizio (il 3° è opzionale). NON usare la cerca singola per più servizi."""
+        """Disponibilità per 2 o 3 servizi INSIEME."""
         services = [
             {"name": service_1_name, "duration_min": service_1_duration_min,
              "operator_slug": service_1_operator_slug, "operator_name": ""},
@@ -443,8 +381,6 @@ class EvaAgent(Agent):
                 _post_json(f"{CORE_BASE}/core-cerca-disponibilita-multi", payload))
         )
 
-    # ───────── C. Prenotazione ─────────
-
     @function_tool()
     async def prenotazione_appuntamento(
         self,
@@ -454,8 +390,7 @@ class EvaAgent(Agent):
         duration_min: int,
         operator_slug: str = "no_preference",
     ) -> str:
-        """Prenota un appuntamento (servizio singolo) DOPO che la cliente ha confermato uno slot.
-        `prefareDateTime` in ISO 8601. name e phone sono presi dai dati lead."""
+        """Prenota un appuntamento (servizio singolo) DOPO conferma della cliente."""
         payload = {
             "prefareDateTime": prefareDateTime,
             "name": self.lead_name,
@@ -497,8 +432,7 @@ class EvaAgent(Agent):
         slot_3_odoo_partner_id: str = "",
         slot_3_odoo_user_id: str = "",
     ) -> str:
-        """Prenota 2 o 3 servizi insieme DOPO conferma esplicita di una combinazione.
-        Passa gli slot ESATTAMENTE come restituiti dalla cerca disponibilità multi."""
+        """Prenota 2 o 3 servizi insieme DOPO conferma esplicita."""
         slots = [_slot(1, locals()), _slot(2, locals())]
         if slot_3_service:
             slots.append(_slot(3, locals()))
@@ -512,8 +446,6 @@ class EvaAgent(Agent):
             context, FILLER_PRENOTAZIONE,
             _post_json(f"{CORE_BASE}/core-prenotazione-multi", payload))
 
-    # ───────── D. Spostamento ─────────
-
     @function_tool()
     async def riprenotazione_appuntamento(
         self,
@@ -525,9 +457,7 @@ class EvaAgent(Agent):
         operator_slug: str = "no_preference",
         orario: str = "",
     ) -> str:
-        """Sposta un singolo appuntamento. `event_id` = id dell'appuntamento esistente,
-        `new_datetime` in ISO 8601."""
-        # ATTENZIONE: la chiave del webhook è "event_id " con uno SPAZIO finale (da preservare).
+        """Sposta un singolo appuntamento."""
         payload = {
             "event_id ": event_id,
             "phone": self.lead_phone,
@@ -573,8 +503,7 @@ class EvaAgent(Agent):
         slot_3_odoo_partner_id: str = "",
         slot_3_odoo_user_id: str = "",
     ) -> str:
-        """Sposta 2 o 3 appuntamenti multi-servizio. Passa gli event_id esistenti e i
-        nuovi slot (come restituiti dalla cerca disponibilità multi)."""
+        """Sposta 2 o 3 appuntamenti multi-servizio."""
         event_ids = [event_id_1, event_id_2]
         slots = [_slot(1, locals()), _slot(2, locals())]
         if event_id_3:
@@ -592,12 +521,9 @@ class EvaAgent(Agent):
             context, FILLER_SPOSTA,
             _post_json(f"{CORE_BASE}/core-spostamento-multi", payload))
 
-    # ───────── E. Cancellazione ─────────
-
     @function_tool()
     async def cancellazione_appuntamento(self, context: RunContext, event_id: str) -> str:
-        """Cancella un singolo appuntamento. `event_id` = id dell'appuntamento."""
-        # ATTENZIONE: chiave "event_id " con SPAZIO finale (da preservare).
+        """Cancella un singolo appuntamento."""
         payload = {
             "event_id ": event_id,
             "phone": self.lead_phone,
@@ -617,7 +543,7 @@ class EvaAgent(Agent):
         event_id_2: str,
         event_id_3: str = "",
     ) -> str:
-        """Cancella 2 o 3 appuntamenti. Passa gli event_id (il 3° è opzionale)."""
+        """Cancella 2 o 3 appuntamenti."""
         event_ids = [event_id_1, event_id_2]
         if event_id_3:
             event_ids.append(event_id_3)
@@ -626,11 +552,9 @@ class EvaAgent(Agent):
             context, FILLER_CANCELLA,
             _post_json(f"{CORE_BASE}/core-cancellazione-multi", payload))
 
-    # ───────── F. Verifica & handoff ─────────
-
     @function_tool()
     async def customer_verification(self, context: RunContext) -> str:
-        """Verifica se la cliente è già presente nel gestionale (per telefono)."""
+        """Verifica se la cliente è già presente nel gestionale."""
         payload = {"phone": self.lead_phone, "tenant_id": self.tenant_id}
         return await self._fill_then(
             context, FILLER_CUSTOMER,
@@ -638,14 +562,11 @@ class EvaAgent(Agent):
 
     @function_tool()
     async def trasferisci_operatore(self, context: RunContext, motivo: str) -> str:
-        """Trasferisci la chiamata a un operatore umano. Usalo SOLO se la cliente lo
-        chiede esplicitamente. `motivo` = breve ragione del trasferimento."""
-        # 1) Resolver: logga/risolve il numero lato n8n.
+        """Trasferisci la chiamata a un operatore umano."""
         resolver = await _post_json(
             f"{CORE_BASE}/core-handoff-resolver",
             {"motivo": motivo, "tenant_id": self.tenant_id},
         )
-        # 2) Transfer SIP reale verso handoff_number (dai metadata), se presente.
         handoff_number = str(self.md.get("handoff_number", "")).strip()
         if not handoff_number:
             return json.dumps(
@@ -657,21 +578,16 @@ class EvaAgent(Agent):
             await _transfer_call_to(self._job_ctx, handoff_number)
             return json.dumps({"resolver": resolver, "transfer": "ok"}, ensure_ascii=False)
         except Exception as e:  # noqa: BLE001
-            # TODO(transfer): se l'API di transfer non è disponibile/abilitata nel progetto,
-            # il transfer vero va cablato dopo che il flusso base funziona. Per ora si chiude
-            # con garbo informando la cliente.
             logger.exception("SIP transfer failed")
             return json.dumps(
                 {"resolver": resolver, "transfer": "failed", "error": str(e)},
                 ensure_ascii=False,
             )
 
-    # riferimento al JobContext (impostato in entrypoint) per il transfer SIP
     _job_ctx: JobContext | None = None
 
 
 def _slot(n: int, scope: dict) -> dict:
-    """Assembla un dict slot dai parametri flat slot_N_* presenti in `scope` (locals())."""
     return {
         "service": scope[f"slot_{n}_service"],
         "start_iso": scope[f"slot_{n}_start_iso"],
@@ -684,9 +600,7 @@ def _slot(n: int, scope: dict) -> dict:
 
 
 async def _transfer_call_to(ctx: JobContext, number: str) -> None:
-    """Transfer SIP del partecipante (il lead) verso `number` via LiveKit Server API."""
     sip_to = number if number.startswith("tel:") or number.startswith("sip:") else f"tel:{number}"
-    # Trova il partecipante SIP (il lead) nella room.
     sip_identity = None
     for ident, p in ctx.room.remote_participants.items():
         if str(getattr(p, "kind", "")).upper().endswith("SIP") or ident.startswith("sip-"):
@@ -704,29 +618,24 @@ async def _transfer_call_to(ctx: JobContext, number: str) -> None:
     )
 
 
-# ───────────────────────── TTS builder (controlli espressivi con fallback) ─────────────────────────
-
 def build_tts():
-    # Config allineata a quella provata di Boss. sonic-3 con speed/volume numerici
-    # (parametri standard, NON i controlli sperimentali "fastest"/emotion).
     return cartesia.TTS(
-        model=CARTESIA_MODEL,           # "sonic-3"
+        model=CARTESIA_MODEL,
         voice=CARTESIA_VOICE,
         language="it",
         speed=1.1,
         volume=1.2,
+        word_timestamps=False,
     )
 
 
 # ───────────────────────── Worker lifecycle ─────────────────────────
 
 def prewarm(proc: JobProcess) -> None:
-    # Carica il VAD una sola volta per processo (riusato dai job).
     proc.userdata["vad"] = silero.VAD.load()
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    # 1) Metadata della room → variableValues
     try:
         md = json.loads(ctx.job.metadata or "{}")
     except json.JSONDecodeError:
@@ -734,12 +643,10 @@ async def entrypoint(ctx: JobContext) -> None:
         md = {}
     logger.info("Eva job per tenant=%s lead=%s", md.get("tenant_id"), md.get("lead_id"))
 
-    # 2) System prompt: template + sostituzione {{placeholder}} dai metadata
     system_prompt = fill_prompt(_load_prompt_template(), md)
 
     await ctx.connect()
 
-    # 3) Sessione (STT/LLM/TTS/VAD/turn)
     vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
     session = AgentSession(
         stt=deepgram.STT(model="nova-3-general", language="it", numerals=True, keyterm=KEYTERMS),
@@ -754,20 +661,15 @@ async def entrypoint(ctx: JobContext) -> None:
     agent = EvaAgent(instructions=system_prompt, md=md)
     agent._job_ctx = ctx
 
-    # ── stato chiamata (per EOC) ──
     loop = asyncio.get_running_loop()
     state = {"ended_reason": "completed", "start": loop.time(), "last_activity": loop.time()}
 
     def _touch(*_args) -> None:
         state["last_activity"] = loop.time()
 
-    # Reset del timer di silenzio su attività (utente/agente). Lo stato "thinking"
-    # (tool call) conta come attività → di fatto sospende il timeout durante i tool.
     session.on("user_state_changed", _touch)
     session.on("agent_state_changed", _touch)
 
-    # Ri-arma il filler a ogni nuovo turno utente (final transcript) → max 1 frase d'attesa
-    # per turno, come Boss. I tool successivi nello stesso turno li copre la musichetta.
     def _on_user_text(ev) -> None:
         _touch()
         if getattr(ev, "is_final", False):
@@ -775,7 +677,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session.on("user_input_transcribed", _on_user_text)
 
-    # Il lead riaggancia → chiusura con motivo dedicato.
     def _on_disconnect(participant) -> None:
         ident = getattr(participant, "identity", "")
         if ident.startswith("sip-") or str(getattr(participant, "kind", "")).upper().endswith("SIP"):
@@ -784,7 +685,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.room.on("participant_disconnected", _on_disconnect)
 
-    # 4) End-of-call: POST al webhook EOC alla chiusura del job.
     async def _send_eoc() -> None:
         duration = max(0, int(loop.time() - state["start"]))
         messages, transcript = _build_transcript(session)
@@ -796,13 +696,10 @@ async def entrypoint(ctx: JobContext) -> None:
             "costEur": round(duration / 60.0 * COST_PER_MINUTE_EUR, 4),
             "transcript": transcript,
             "messages": messages,
-            # contesto utile al workflow di qualificazione
             "lead_name": md.get("lead_name"),
             "lead_phone": md.get("lead_phone"),
             "attempt_number": md.get("attempt_number"),
             "agent": AGENT_NAME,
-            # esito AMD (None se AMD disabilitato/non disponibile): permette al workflow
-            # di qualificazione di separare voicemail/IVR dai pickup umani reali.
             "amd_category": state.get("amd_category"),
         }
         logger.info("EOC POST (reason=%s, dur=%ss)", state["ended_reason"], duration)
@@ -810,34 +707,31 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_send_eoc)
 
-    # 5) Avvia la sessione
     await session.start(agent=agent, room=ctx.room)
 
-    # Musichetta d'attesa: parte da sola quando l'agente "pensa" (tool in corso) e si ferma
-    # da sola quando ricomincia a parlare. Canale audio separato → maschera la latenza SENZA
-    # rischio di zittire l'agente. Complementare al filler vocale.
     try:
         background_audio = BackgroundAudioPlayer(thinking_sound=THINKING_SOUND)
         await background_audio.start(room=ctx.room, agent_session=session)
     except Exception as e:  # noqa: BLE001
         logger.warning("musichetta d'attesa non avviata: %s", e)
 
-    # 6) Outbound first turn con AMD: attende il lead, classifica umano/segreteria/IVR,
-    #    e SOLO se risponde una PERSONA (o esito incerto) apre la conversazione.
-    #    Se AMD è disabilitato o non presente nella versione installata → flusso originale.
+    # ── Costruisce la frase di apertura PRIMA dell'AMD (barge-in) ──
+    lead_name_barge = str(md.get("lead_name", "")).strip()
+    nome_parte_barge = f", {lead_name_barge}" if lead_name_barge else ""
+    business_name_barge = str(md.get("business_name", "il nostro centro")).strip()
+    frase_apertura_barge = f"Buongiorno{nome_parte_barge}, sono la consulente di {business_name_barge}!"
+
     if _AMD_AVAILABLE and AMD_ENABLED:
-        # ivr_detection=False: non navighiamo alberi IVR (consumer outbound). Cosa fare su
-        # machine-ivr (riagganciare o trattare come umano) è governato da AMD_IVR_HANGUP.
-        # llm: AMD_LLM_MODEL se impostata, altrimenti default LiveKit Inference.
-        # detection_options: solo le soglie effettivamente impostate via ENV.
-        # suppress_compatibility_warning=True: silenzia il warning sui modelli di classifica.
         amd_kwargs: dict = {"ivr_detection": False, "suppress_compatibility_warning": True}
         if AMD_LLM_MODEL:
-            amd_kwargs["llm"] = AMD_LLM_MODEL
+            # FIX: openai.LLM(model=...) non stringa grezza
+            amd_kwargs["llm"] = openai.LLM(model=AMD_LLM_MODEL)
         if AMD_DETECTION_OPTIONS:
             amd_kwargs["detection_options"] = AMD_DETECTION_OPTIONS
+
+        say_task = None
+
         async with AMD(session, **amd_kwargs) as detector:
-            # Il SIP participant lo crea il dispatcher; qui attendiamo solo che si connetta.
             try:
                 await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
             except asyncio.TimeoutError:
@@ -846,7 +740,25 @@ async def entrypoint(ctx: JobContext) -> None:
                 await _hangup(ctx)
                 return
 
-            # Classifica la chiamata (gira una volta, sul saluto iniziale).
+            # BARGE-IN: frase brevissima + generate_reply in parallelo con AMD
+            async def _say_opening_eva():
+                try:
+                    await session.say(frase_apertura_barge, allow_interruptions=False)
+                    logger.info("BARGE-IN Eva completato")
+                    await session.generate_reply(
+                        instructions=(
+                            "Hai appena detto la presentazione. "
+                            "Prosegui con STEP 1 del prompt: "
+                            "contesto della chiamata e domanda di apertura. "
+                            "Una sola frase, poi aspetta la risposta."
+                        )
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.debug("barge-in Eva interrotto: %s", _e)
+
+            say_task = asyncio.create_task(_say_opening_eva(), name="say_opening_eva")
+            logger.info("BARGE-IN Eva avviato in parallelo con AMD")
+
             try:
                 result = await detector.execute()
                 category = getattr(result, "category", "uncertain")
@@ -856,14 +768,14 @@ async def entrypoint(ctx: JobContext) -> None:
             state["amd_category"] = category
             logger.info("AMD category=%s", category)
 
-            # human/uncertain → conversazione normale.
-            # machine-ivr → riaggancia solo se AMD_IVR_HANGUP, altrimenti tratta come umano.
-            # machine-vm / machine-unavailable → niente conversazione.
             hangup_categories = {"machine-vm", "machine-unavailable"}
             if AMD_IVR_HANGUP:
                 hangup_categories.add("machine-ivr")
 
             if category in hangup_categories:
+                if say_task and not say_task.done():
+                    say_task.cancel()
+                    logger.info("AMD → segreteria: barge-in Eva cancellato")
                 if category == "machine-vm" and AMD_LEAVE_VOICEMAIL:
                     try:
                         await session.generate_reply(instructions=AMD_VOICEMAIL_INSTRUCTIONS)
@@ -876,12 +788,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 }.get(category, "machine")
                 await _hangup(ctx)
                 return
-            # altrimenti (human/uncertain, o machine-ivr con AMD_IVR_HANGUP=false) → prosegui
+            # human/uncertain → conversazione già avviata dal barge-in
+
     else:
-        # AMD off o non disponibile: comportamento originale (attendi il partecipante).
         if AMD_ENABLED and not _AMD_AVAILABLE:
-            logger.warning("AMD richiesto ma non disponibile in questa versione di "
-                           "livekit-agents → flusso senza rilevamento segreteria")
+            logger.warning("AMD richiesto ma non disponibile → flusso senza rilevamento segreteria")
         try:
             await asyncio.wait_for(ctx.wait_for_participant(), timeout=90)
         except asyncio.TimeoutError:
@@ -889,8 +800,20 @@ async def entrypoint(ctx: JobContext) -> None:
             state["ended_reason"] = "no_answer"
             await _hangup(ctx)
             return
+        # Fallback senza AMD: apertura diretta
+        try:
+            await session.say(frase_apertura_barge, allow_interruptions=False)
+            await session.generate_reply(
+                instructions=(
+                    "Hai appena detto la presentazione. "
+                    "Prosegui con STEP 1 del prompt: "
+                    "contesto e domanda di apertura. Una frase, poi aspetta."
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("apertura fallback Eva: %s", e)
 
-    # Watchdog silenzio (auto-hangup ~191s)
+    # Watchdog silenzio
     async def _silence_watchdog() -> None:
         while True:
             await asyncio.sleep(5)
@@ -901,25 +824,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 return
 
     watchdog_task = asyncio.create_task(_silence_watchdog())
-    ctx.add_shutdown_callback(lambda: _cancel(watchdog_task))
+    ctx.add_shutdown_callback(lambda _=None: watchdog_task.cancel() if not watchdog_task.done() else None)
 
     _touch()
-    # L'agente parla per primo (STEP 1 del prompt). Niente firstMessage fisso.
-    await session.generate_reply(
-        instructions=(
-            "È una chiamata in USCITA: inizi tu. Apri la conversazione seguendo STEP 1 "
-            "del tuo system prompt (presentazione e contesto), in italiano, calda e naturale. "
-            "Usa il nome della cliente se disponibile. Una o due frasi, poi attendi la risposta."
-        )
-    )
-
-
-async def _cancel(task: asyncio.Task) -> None:
-    task.cancel()
 
 
 async def _hangup(ctx: JobContext) -> None:
-    """Chiude la chiamata cancellando la room (fa scattare gli shutdown callback → EOC)."""
     try:
         await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
     except Exception:  # noqa: BLE001
@@ -927,7 +837,6 @@ async def _hangup(ctx: JobContext) -> None:
 
 
 def _build_transcript(session: AgentSession) -> tuple[list[dict], str]:
-    """Serializza la cronologia della conversazione per il payload EOC."""
     messages: list[dict] = []
     try:
         for item in session.history.items:
